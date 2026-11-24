@@ -96,8 +96,10 @@ async def test_stale_terminal_without_assistant_is_rejected():
         _ = [e async for e in driver.stream("hello")]
 
 
-async def test_login_alone_cannot_open_production_gate(monkeypatch):
+async def test_doctor_succeeds_when_logged_in_and_rejects_logged_out(monkeypatch):
     from litellm_claude_rpc import driver as module
+
+    logged_in = True
 
     class Process:
         returncode = 0
@@ -109,12 +111,16 @@ async def test_login_alone_cannot_open_production_gate(monkeypatch):
             return (
                 b"2.1.321 (Claude Code)"
                 if "--version" in self.args
-                else b'{"loggedIn":true}'
+                else (b'{"loggedIn":true}' if logged_in else b'{"loggedIn":false}')
             ), b""
 
     async def spawn(*args, **kwargs):
         return Process(args)
 
     monkeypatch.setattr(module.asyncio, "create_subprocess_exec", spawn)
-    with pytest.raises(GatewayError, match="claude_live_acceptance_pending"):
+    status = await module.doctor(Config())
+    assert status["status"] == "ready"
+    assert status["cli_version"] == "2.1.321"
+    logged_in = False
+    with pytest.raises(GatewayError, match="cli_login_required"):
         await module.doctor(Config())

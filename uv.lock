@@ -868,6 +868,7 @@ version = "0.1.0.dev0"
 source = { editable = "." }
 dependencies = [
     { name = "claude-agent-sdk" },
+    { name = "jsonschema" },
     { name = "litellm" },
     { name = "uvicorn" },
 ]
@@ -884,6 +885,7 @@ dev = [
 requires-dist = [
     { name = "build", marker = "extra == 'dev'", specifier = ">=1,<2" },
     { name = "claude-agent-sdk", specifier = "==0.2.180" },
+    { name = "jsonschema", specifier = ">=4.20,<5" },
     { name = "litellm", specifier = "==1.109.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8,<10" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=1,<2" },

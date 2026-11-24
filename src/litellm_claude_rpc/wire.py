@@ -6,6 +6,7 @@ control protocol, permission callbacks, parsing of message types and turns.
 
 import asyncio
 import os
+from pathlib import Path
 
 from claude_agent_sdk._internal.transport import Transport
 from claude_agent_sdk._internal.transport.subprocess_cli import SubprocessCLITransport
@@ -14,7 +15,7 @@ from .contracts import GatewayError, strict_json
 from .process import ProcessTree
 
 
-def child_environment():
+def child_environment(isolation_root=None):
     # Deliberately omit credential/provider overrides, debug, hooks, NODE_OPTIONS,
     # Python injection and telemetry variables. Official CLI reads its own login.
     allowed = {
@@ -37,6 +38,11 @@ def child_environment():
         "SSL_CERT_DIR",
     }
     env = {k: v for k, v in os.environ.items() if k.upper() in allowed}
+    if isolation_root is not None:
+        for key in ("HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "TEMP", "TMP"):
+            folder = Path(isolation_root) / ("isolated-" + key.lower())
+            folder.mkdir(exist_ok=True)
+            env[key] = str(folder)
     env.update(
         CLAUDE_CODE_ENTRYPOINT="sdk-py",
         CLAUDE_CODE_SDK_READS_SESSION_STATE="1",
@@ -46,13 +52,14 @@ def child_environment():
 
 
 class SDKWire(Transport):
-    def __init__(self, options, config):
+    def __init__(self, options, config, *, isolation_root=None):
         async def empty():
             if False:
                 yield {}
 
         self.builder = SubprocessCLITransport(empty(), options)
         self.options, self.config = options, config
+        self.isolation_root = isolation_root
         self.proc = self.tree = None
         self.lock = asyncio.Lock()
 
@@ -61,7 +68,7 @@ class SDKWire(Transport):
             asyncio.create_subprocess_exec(
                 *self.builder._build_command(),
                 cwd=self.options.cwd,
-                env=child_environment(),
+                env=child_environment(self.isolation_root),
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,

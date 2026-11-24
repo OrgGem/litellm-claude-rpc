@@ -198,3 +198,93 @@ async def test_slash_leading_text_is_preserved_as_literal_delta():
         assert '"content": "/home/report"' in response
     finally:
         await pool.close()
+
+
+async def test_waiting_same_conversation_does_not_hold_concurrency_slot():
+    a1_entered, release_a1 = asyncio.Event(), asyncio.Event()
+
+    class Gated(Agent):
+        async def stream(self, prompt):
+            self.turns += 1
+            if "a1" in prompt and self.turns == 1:
+                a1_entered.set()
+                await release_a1.wait()
+            yield Event(text=f"turn-{self.turns}:{prompt}")
+            yield Event(done=True)
+
+    pool = SessionPool(Config(concurrency=2, max_sessions=4), Gated)
+    try:
+        a1 = asyncio.create_task(
+            answer(pool, [{"role": "user", "content": "a1"}], "conv-a")
+        )
+        await a1_entered.wait()
+        a2 = asyncio.create_task(
+            answer(
+                pool,
+                [
+                    {"role": "user", "content": "a1"},
+                    {"role": "assistant", "content": "turn-1:" + Request.parse({"model": "claude-default", "messages": [{"role": "user", "content": "a1"}]}, "conv-a", pool.config).bootstrap()},
+                    {"role": "user", "content": "a2"},
+                ],
+                "conv-a",
+            )
+        )
+        await asyncio.sleep(0.03)
+        # Conversation B is independent and must complete while A1 is still running
+        b_res = await asyncio.wait_for(
+            answer(pool, [{"role": "user", "content": "b1"}], "conv-b"),
+            timeout=0.5,
+        )
+        assert b_res.startswith("turn-1:")
+        release_a1.set()
+        _, a2_res = await asyncio.gather(a1, a2)
+        assert a2_res == "turn-2:a2"
+    finally:
+        release_a1.set()
+        await pool.close()
+        await asyncio.gather(a1, a2, return_exceptions=True)
+
+
+@pytest.mark.parametrize(
+    "trailing_role,trailing_text",
+    [
+        ("developer", "dev-guidance"),
+        ("assistant", "assistant-prefill"),
+        ("developer", "/slash-dev"),
+    ],
+)
+async def test_reused_session_with_flatten_preserves_trailing_role_label(
+    trailing_role, trailing_text
+):
+    received = []
+
+    class Recording(Agent):
+        async def stream(self, prompt):
+            self.turns += 1
+            received.append(prompt)
+            yield Event(text=f"reply-{self.turns}")
+            yield Event(done=True)
+
+    pool = SessionPool(Config(flatten=True), Recording)
+    try:
+        cid = f"conv-{trailing_role}"
+        first = await answer(pool, [{"role": "user", "content": "u1"}], cid)
+        assert first == "reply-1"
+        second = await answer(
+            pool,
+            [
+                {"role": "user", "content": "u1"},
+                {"role": "assistant", "content": "reply-1"},
+                {"role": trailing_role, "content": trailing_text},
+            ],
+            cid,
+        )
+        assert second == "reply-2"
+        reused_prompt = received[-1]
+        assert reused_prompt != trailing_text
+        assert f'"role": "{trailing_role}"' in reused_prompt
+        assert f'"content": "{trailing_text}"' in reused_prompt
+        assert '"role": "user"' not in reused_prompt
+    finally:
+        await pool.close()
+

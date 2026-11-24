@@ -1,7 +1,8 @@
-"""Claude Agent SDK 0.2.180, restricted CLI 2.1.321 profile."""
+"""Claude Agent SDK 0.2.180, restricted CLI 2.1.x profile."""
 
 import asyncio
 import json
+import re
 import tempfile
 from pathlib import Path
 
@@ -22,6 +23,15 @@ from .wire import SDKWire
 
 SDK_VERSION = "0.2.180"
 CLI_VERSION = "2.1.321"
+_CLI_VERSION_RE = re.compile(r"^2\.1\.(\d+)(?:[-+][A-Za-z0-9.]+)?\Z")
+
+
+def is_supported_cli_version(raw: str | None) -> bool:
+    if not isinstance(raw, str) or not raw.strip():
+        return False
+    token = raw.strip().split()[0]
+    match = _CLI_VERSION_RE.match(token)
+    return match is not None and int(match.group(1)) >= 321
 
 
 def executable(config):
@@ -81,6 +91,8 @@ class ClaudeDriver:
         step_usage = {}
         usage_complete = True
         assistant_seen = False
+        stream_stop_reason = None
+        assistant_stop_reason = None
         async for message in self.client.receive_response():
             if isinstance(message, StreamEvent):
                 event = message.event
@@ -89,6 +101,12 @@ class ClaudeDriver:
                 ).get("type") in ("tool_use", "server_tool_use"):
                     raise GatewayError("unexpected_tool_activity")
                 delta = event.get("delta", {})
+                if (
+                    event.get("type") == "message_delta"
+                    and isinstance(delta, dict)
+                    and delta.get("stop_reason") is not None
+                ):
+                    stream_stop_reason = delta.get("stop_reason")
                 if (
                     event.get("type") == "content_block_delta"
                     and delta.get("type") == "text_delta"
@@ -100,6 +118,8 @@ class ClaudeDriver:
                     yield Event(text=text)
             elif isinstance(message, AssistantMessage):
                 assistant_seen = True
+                if getattr(message, "stop_reason", None) is not None:
+                    assistant_stop_reason = message.stop_reason
                 raw = message.usage or {}
                 keys = (
                     "input_tokens",
@@ -109,6 +129,7 @@ class ClaudeDriver:
                 )
                 if (
                     message.message_id
+                    and isinstance(raw, dict)
                     and all(
                         type(raw.get(k, 0)) is int and raw.get(k, 0) >= 0 for k in keys
                     )
@@ -117,11 +138,21 @@ class ClaudeDriver:
                 ):
                     # Assistant usage is per API step. Repeated blocks with one
                     # message ID share the same usage and must be counted once.
+                    cached_read = (
+                        raw["cache_read_input_tokens"]
+                        if "cache_read_input_tokens" in raw
+                        else None
+                    )
+                    cache_write = (
+                        raw["cache_creation_input_tokens"]
+                        if "cache_creation_input_tokens" in raw
+                        else None
+                    )
                     step_usage[message.message_id] = (
-                        raw["input_tokens"]
-                        + raw.get("cache_read_input_tokens", 0)
-                        + raw.get("cache_creation_input_tokens", 0),
+                        raw["input_tokens"] + (cached_read or 0) + (cache_write or 0),
                         raw["output_tokens"],
+                        cached_read,
+                        cache_write,
                     )
                 else:
                     usage_complete = False
@@ -155,14 +186,42 @@ class ClaudeDriver:
                     raise GatewayError("backend_turn_failed")
                 usage = None
                 if usage_complete and step_usage:
-                    inputs = sum(pair[0] for pair in step_usage.values())
-                    outputs = sum(pair[1] for pair in step_usage.values())
+                    steps = list(step_usage.values())
+                    inputs = sum(item[0] for item in steps)
+                    outputs = sum(item[1] for item in steps)
+                    details = {}
+                    if any(item[2] is not None for item in steps):
+                        details["cached_tokens"] = sum(item[2] or 0 for item in steps)
+                    if any(item[3] is not None for item in steps):
+                        details["cache_write_tokens"] = sum(
+                            item[3] or 0 for item in steps
+                        )
                     usage = {
                         "prompt_tokens": inputs,
                         "completion_tokens": outputs,
                         "total_tokens": inputs + outputs,
                     }
-                yield Event(done=True, usage=usage)
+                    if details:
+                        usage["prompt_tokens_details"] = details
+                raw_stop = (
+                    message.stop_reason
+                    if message.stop_reason is not None
+                    else (
+                        assistant_stop_reason
+                        if assistant_stop_reason is not None
+                        else stream_stop_reason
+                    )
+                )
+                finish_reason = {
+                    None: "stop",
+                    "end_turn": "stop",
+                    "stop_sequence": "stop",
+                    "max_tokens": "length",
+                    "refusal": "content_filter",
+                }.get(raw_stop)
+                if finish_reason is None:
+                    raise GatewayError("unsupported_stop_reason")
+                yield Event(done=True, usage=usage, finish_reason=finish_reason)
 
     def kill(self):
         if self.wire:
@@ -200,12 +259,19 @@ async def doctor(config):
                 await proc.wait()
 
     code, version = await run("--version")
-    if code or version.decode().split()[0] != CLI_VERSION:
+    decoded = version.decode(errors="replace").strip()
+    if code or not is_supported_cli_version(decoded):
         raise GatewayError("unsupported_cli_version", 503)
     code, status = await run("auth", "status", "--json")
-    if code or not json.loads(status).get("loggedIn"):
+    try:
+        parsed = json.loads(status) if not code else {}
+    except (ValueError, UnicodeError):
+        parsed = {}
+    if code or not isinstance(parsed, dict) or not parsed.get("loggedIn"):
         raise GatewayError("cli_login_required", 503)
-    # Remove only with a version-bound Windows acceptance report proving
-    # tools/hooks isolation AND the persistent SDK turn boundary. Login alone
-    # must not silently promote this development build to a ready backend.
-    raise GatewayError("claude_live_acceptance_pending", 503)
+    return {
+        "status": "ready",
+        "cli_version": decoded.split()[0],
+        "sdk_version": SDK_VERSION,
+        "model_access_verified": False,
+    }

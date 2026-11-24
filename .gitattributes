@@ -1,0 +1,2 @@
+# G0b hashes are computed over exact LF bytes on every platform.
+src/litellm_claude_rpc/contract_v0_1/* text eol=lf

@@ -4,15 +4,16 @@ build-backend = "hatchling.build"
 
 [project]
 name = "litellm-claude-rpc"
-version = "0.1.0.dev0"
+version = "0.2.0.dev0"
 description = "Restricted Claude CLI sessions behind a LiteLLM provider and local API"
 requires-python = ">=3.11,<3.14"
-dependencies = ["litellm==1.109.0", "claude-agent-sdk==0.2.180", "uvicorn==0.54.0"]
+dependencies = ["litellm==1.109.0", "claude-agent-sdk==0.2.180", "uvicorn==0.54.0", "jsonschema>=4.20,<5"]
 
 [project.scripts]
 claude-rpc = "litellm_claude_rpc.cli:main"
 
 [project.optional-dependencies]
+proxy = ["litellm[proxy]==1.109.0"]
 dev = ["pytest>=8,<10", "pytest-asyncio>=1,<2", "ruff>=0.14,<1", "build>=1,<2"]
 
 [tool.hatch.build.targets.wheel]
